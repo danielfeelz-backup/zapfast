@@ -1,0 +1,104 @@
+workflows:
+  macos-finder-lock:
+    name: ZapFast PR 1158 macOS native Finder Lock
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    inputs:
+      run_full_suites:
+        description: Run both full suites after the Finder Lock test passes
+        type: boolean
+        default: true
+    environment:
+      vars:
+        ZAPFAST_COMMIT: "af4a2ecf9dc1552dc70e099ab529dbdd95bb9c2b"
+        ZAPFAST_RUST: "1.98.0"
+        CARGO_TERM_COLOR: "never"
+    scripts:
+      - name: Check out and record the native macOS test environment
+        script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$CM_BUILD_DIR"
+          test "$CM_BRANCH" = qa/macos-validation
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          test "$(id -u)" -ne 0
+
+          qa="$CM_BUILD_DIR/.codemagic-qa"
+          mkdir -p "$qa/logs" "$qa/tmp"
+          if ! git cat-file -e "$ZAPFAST_COMMIT^{commit}"; then
+            git fetch --no-tags origin "$ZAPFAST_COMMIT"
+          fi
+          git worktree add --detach "$qa/source" "$ZAPFAST_COMMIT"
+          actual_commit="$(git -C "$qa/source" rev-parse HEAD)"
+          test "$actual_commit" = "$ZAPFAST_COMMIT"
+          grep -Fx "channel = \"$ZAPFAST_RUST\"" "$qa/source/rust-toolchain.toml"
+
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs |
+              sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+          fi
+          rustup toolchain install "$ZAPFAST_RUST" --profile minimal
+
+          {
+            printf 'QA config commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'ZapFast commit tested: %s\n' "$actual_commit"
+            sw_vers
+            printf 'Architecture: %s\n' "$(uname -m)"
+            printf 'UID: %s\n' "$(id -u)"
+            xcodebuild -version
+            rustc "+$ZAPFAST_RUST" -vV
+            printf 'Filesystem of Finder Lock fixtures:\n'
+            df -P "$qa/tmp"
+            device="$(df -P "$qa/tmp" | awk 'NR == 2 { print $1 }')"
+            test -n "$device"
+            diskutil info "$device" |
+              grep -E '^[[:space:]]*(File System Personality|Type \(Bundle\)):'
+          } | tee "$qa/logs/environment.log"
+          grep -Fx 'host: aarch64-apple-darwin' "$qa/logs/environment.log"
+
+      - name: Run the real Finder Lock test and verify execution
+        script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          qa="$CM_BUILD_DIR/.codemagic-qa"
+          cd "$qa/source"
+          test "$(git rev-parse HEAD)" = "$ZAPFAST_COMMIT"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export TMPDIR="$qa/tmp"
+          test_name=backend::worker::attachment_provenance::tests::finder_lock_stays_on_the_source_across_save_as_and_save_all
+
+          time cargo "+$ZAPFAST_RUST" test --locked --lib --target aarch64-apple-darwin \
+            "$test_name" -- --exact --nocapture --test-threads=1 2>&1 |
+            tee "$qa/logs/finder-lock.log"
+          grep -Fx 'running 1 test' "$qa/logs/finder-lock.log"
+          grep -Fx "test $test_name ... ok" "$qa/logs/finder-lock.log"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$qa/logs/finder-lock.log"
+
+          find "$TMPDIR" -name '.attachment-save.*.tmp' -print |
+            tee "$qa/logs/residual-staging.log"
+          test ! -s "$qa/logs/residual-staging.log"
+          printf '%s\n' 'CR-03 PASS: Finder Lock and quarantine assertions passed, source preserved, no staging residue.' |
+            tee "$qa/logs/result.log"
+
+      - name: Run the default and all-features suites
+        when:
+          condition: ${{ inputs.run_full_suites }}
+        script: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          qa="$CM_BUILD_DIR/.codemagic-qa"
+          grep -q '^CR-03 PASS:' "$qa/logs/result.log"
+          cd "$qa/source"
+          test "$(git rev-parse HEAD)" = "$ZAPFAST_COMMIT"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          export TMPDIR="$qa/tmp"
+
+          time cargo "+$ZAPFAST_RUST" test --locked --all-targets --target aarch64-apple-darwin 2>&1 |
+            tee "$qa/logs/tests-default.log"
+          time cargo "+$ZAPFAST_RUST" test --locked --all-targets --all-features --target aarch64-apple-darwin 2>&1 |
+            tee "$qa/logs/tests-all-features.log"
+
+    artifacts:
+      - .codemagic-qa/logs/*.log
